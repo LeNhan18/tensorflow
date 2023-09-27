@@ -146,7 +146,7 @@ T& CompilationEnvironments::GetMutableEnv() {
 
   // TODO(b/302086111): Remove after XLA has an updated protobuf version.
 #if TSL_IS_IN_OSS
-  return tensorflow::down_cast<T&>(*it->second);
+  return tsl::down_cast<T&>(*it->second);
 #else
   return tsl::protobuf::DownCastToGenerated<T>(*it->second);
 #endif

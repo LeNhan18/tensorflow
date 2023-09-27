@@ -156,7 +156,7 @@ class ResourceHandle {
   template <typename T>
   StatusOr<T*> GetResource() const {
     TF_RETURN_IF_ERROR(ValidateType<T>());
-    return down_cast<T*>(resource_.get());
+    return tsl::down_cast<T*>(resource_.get());
   }
 
   // Returns True if the resource handle is ref-counting.

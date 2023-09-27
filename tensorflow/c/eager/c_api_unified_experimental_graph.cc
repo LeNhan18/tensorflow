@@ -371,7 +371,7 @@ class GraphContext : public TracingContext {
           "Unable to cast input to GraphTensor");
     }
     inputs_.push_back(t->output_);
-    *output = tensorflow::down_cast<TracingTensorHandle*>(outputs[0]);
+    *output = tsl::down_cast<TracingTensorHandle*>(outputs[0]);
     return absl::OkStatus();
   }
 
