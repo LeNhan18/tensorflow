@@ -114,6 +114,27 @@ bool IsAsyncPair(const HloInstruction& from, const HloInstruction& target) {
   return IsGpuAsyncStart(from) && IsGpuAsyncDone(target);
 }
 
+// Count the maximum overlapping count in subgroups of group and other
+size_t CountOverlappingRanks(const std::vector<ReplicaGroup>& group,
+                             const std::vector<ReplicaGroup>& other) {
+  size_t overlapping_count = 0;
+  for (const auto& curr_replica_group : group) {
+    absl::flat_hash_set<int> curr_replica_ids;
+    for (const auto curr_replica_id : curr_replica_group.replica_ids()) {
+      curr_replica_ids.insert(curr_replica_id);
+    }
+
+    for (const auto& replica_group : other) {
+      size_t subgroup_count = 0;
+      for (const auto replica_id : replica_group.replica_ids()) {
+        if (curr_replica_ids.contains(replica_id)) ++subgroup_count;
+      }
+      overlapping_count = std::max(overlapping_count, subgroup_count);
+    }
+  }
+  return overlapping_count;
+}
+
 }  // namespace
 
 int64_t GetSizeOfShape(const Shape& shape, int pointer_size) {
@@ -139,6 +160,78 @@ CanonicalAsyncOp GpuGetCanonicalAsyncOp(const HloInstruction& hlo) {
     default:
       return DefaultGetCanonicalAsyncOp(hlo);
   }
+}
+
+bool GpuIsResourceConstrained(
+    const DefaultSchedulerCore::SchedulingState& sched_state,
+    DefaultSchedulerCore::ScheduleCandidate& cand) {
+  if (cand.resource_constrained) {
+    return *cand.resource_constrained;
+  }
+  if (cand.node->GetResources().empty()) {
+    cand.resource_constrained = false;
+    return *(cand.resource_constrained);
+  }
+  cand.resource_constrained = false;
+  for (const auto& [resource_type, usage_type] : cand.node->GetResources()) {
+    auto max_it = sched_state.max_concurrent_resource.find(resource_type);
+    auto res_it = sched_state.resource_users_in_queue.find(resource_type);
+    cand.resource_constrained =
+        max_it != sched_state.max_concurrent_resource.end() &&
+        max_it->second == 0 &&
+        res_it != sched_state.resource_users_in_queue.end() &&
+        res_it->second > 0;
+
+    // If the candidate collective has more than 1 overlapping ranks with
+    // in-flight collectives, they can form cyclic dependency and cannot be
+    // overlapped
+    if ((resource_type - AsyncTracker::GetFirstTargetDefinedResource()) ==
+            static_cast<int64_t>(GpuResourceType::kGpuAsyncStreamCollectives) &&
+        sched_state.resource_occupiers_in_flight.contains(resource_type) &&
+        sched_state.resource_occupiers_in_flight.at(resource_type).size() > 0) {
+      const HloInstruction& curr_hlo_inst = cand.node->GetInstr();
+      if (hlo_query::IsAsyncCollectiveDoneOp(&curr_hlo_inst, true)) {
+        CHECK(hlo_query::IsAsyncCollectiveStartOp(curr_hlo_inst.operand(0),
+                                                  true));
+        const HloInstruction* curr_start_inst =
+            curr_hlo_inst.operand(0)->async_wrapped_instruction();
+
+        // If candidate can be overlapped with in-flight collectives
+        bool can_overlap = true;
+        for (const auto occupier :
+             sched_state.resource_occupiers_in_flight.at(resource_type)) {
+          const HloInstruction& hlo_inst = occupier->GetInstr();
+          if (hlo_query::IsAsyncCollectiveDoneOp(&hlo_inst, true)) {
+            const HloInstruction* start_inst = hlo_inst.operand(0);
+            // Number of overlapping ranks between this occupier and candidate
+            size_t overlapping_count =
+                CountOverlappingRanks(curr_start_inst->replica_groups(),
+                                      start_inst->replica_groups());
+            if (overlapping_count > 1) {
+              can_overlap = false;
+              VLOG(3)
+                  << "Collectives have " << overlapping_count
+                  << "overlapping ranks and cannot be overlapped. Candidate "
+                     "collective: "
+                  << curr_start_inst->ToString()
+                  << ", in flight collective: " << start_inst->ToString();
+              break;
+            }
+          }
+        }
+
+        if (!can_overlap) {
+          cand.resource_constrained = true;
+          return *cand.resource_constrained;
+        }
+      }
+    }
+
+    if (*cand.resource_constrained) {
+      return *cand.resource_constrained;
+    }
+  }
+  return *cand.resource_constrained;
 }
 
 //===--------------------------------------------------------------------===//

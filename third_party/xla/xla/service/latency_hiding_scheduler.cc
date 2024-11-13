@@ -47,6 +47,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/hlo/ir/hlo_schedule.h"
+#include "xla/hlo/utils/hlo_query.h"
 #include "xla/map_util.h"
 #include "xla/service/dump.h"
 #include "xla/service/hlo_buffer.h"
@@ -825,10 +826,12 @@ class ReadySetLt {
   explicit ReadySetLt(
       const DefaultSchedulerCore::SchedulingState* sched_state,
       DefaultSchedulerCore::TargetSchedulingRule target_scheduling_rule,
-      DefaultSchedulerCore::TargetSchedulingRule early_target_scheduling_rule)
+      DefaultSchedulerCore::TargetSchedulingRule early_target_scheduling_rule,
+      DefaultSchedulerCore::ResourceConstrainRule is_resource_constrained)
       : sched_state_(*sched_state),
         target_scheduling_rule_(target_scheduling_rule),
-        early_target_scheduling_rule_(early_target_scheduling_rule) {}
+        early_target_scheduling_rule_(early_target_scheduling_rule),
+        is_resource_constrained_(is_resource_constrained) {}
   // The comparison here implements the priority for the nodes in the ready set.
   DefaultSchedulerCore::CandidateResult operator()(
       DefaultSchedulerCore::ScheduleCandidate& a,
@@ -913,7 +916,7 @@ class ReadySetLt {
     if (auto value = DefaultSchedulerCore::ChooseBestCandidate(
             ShouldScheduleAsyncDone(a), a, ShouldScheduleAsyncDone(b), b,
             "kScheduleDone")) {
-      return *value;
+      if (!is_resource_constrained_(sched_state_, value->result)) return *value;
     }
 
     // The following rule targets the async ops using resources that should be
@@ -969,11 +972,12 @@ class ReadySetLt {
       if (auto value = DefaultSchedulerCore::ChooseBestCandidate(
               /*first_cond=*/!(a.node->DoesReleaseAnyResource() &&
                                a.node->GetAsyncDepth() == 0 &&
-                               !IsResourceConstrained(a)),
+                               !is_resource_constrained_(sched_state_, a)),
               a,
               /*second_cond=*/
               !(b.node->DoesReleaseAnyResource() &&
-                b.node->GetAsyncDepth() == 0 && !IsResourceConstrained(b)),
+                b.node->GetAsyncDepth() == 0 &&
+                !is_resource_constrained_(sched_state_, b)),
               b, "kStartAtZeroDepth")) {
         return value;
       }
@@ -997,7 +1001,7 @@ class ReadySetLt {
     if (auto value = DefaultSchedulerCore::ChooseBestCandidate(
             a_ready_interval < b_ready_interval, a,
             b_ready_interval < a_ready_interval, b, "kLessStall")) {
-      return *value;
+      if (!is_resource_constrained_(sched_state_, value->result)) return *value;
     }
     if (sched_state_.config.resource_serializing) {
       // Prioritize scheduling the instruction which has less serial-resource
@@ -1016,13 +1020,17 @@ class ReadySetLt {
     if (sched_state_.config.aggressive_scheduling_policies &&
         !sched_state_.config.prioritize_async_depth_over_stall) {
       if (auto value = async_depth_0_candidate(a, b)) {
-        return *value;
+        if (!is_resource_constrained_(sched_state_, value->result))
+          return *value;
       }
     }
     if (auto value = DefaultSchedulerCore::ChooseBestCandidate(
-            a.node->DoesReleaseAnyResource() && IsResourceConstrained(a), a,
-            b.node->DoesReleaseAnyResource() && IsResourceConstrained(b), b,
-            "kFreeBackedupResource")) {
+            a.node->DoesReleaseAnyResource() &&
+                is_resource_constrained_(sched_state_, a),
+            a,
+            b.node->DoesReleaseAnyResource() &&
+                is_resource_constrained_(sched_state_, b),
+            b, "kFreeBackedupResource")) {
       return *value;
     }
     if (sched_state_.config.aggressive_scheduling_policies) {
@@ -1033,7 +1041,8 @@ class ReadySetLt {
               a.node->GetAsyncDepth() > b.node->GetAsyncDepth(), a,
               b.node->GetAsyncDepth() > a.node->GetAsyncDepth(), b,
               "kAsyncDepth")) {
-        return *value;
+        if (!is_resource_constrained_(sched_state_, value->result))
+          return *value;
       }
       // Favor nodes that are the closest in amount of latency they hide with
       // the highest amount of latency that needs to be hidden to avoid
@@ -1125,10 +1134,12 @@ class ReadySetLt {
     }
     // If none of the heuristics above triggers then prefer to schedule
     // according the original order so that we don't impact memory pressure.
-    if (sched_state_.sched_graph.OriginalInstructionPosition(
-            &a.node->GetInstr()) >
-        sched_state_.sched_graph.OriginalInstructionPosition(
-            &b.node->GetInstr())) {
+    if ((sched_state_.sched_graph.OriginalInstructionPosition(
+             &a.node->GetInstr()) >
+         sched_state_.sched_graph.OriginalInstructionPosition(
+             &b.node->GetInstr())) ||
+        (!is_resource_constrained_(sched_state_, a) &&
+         is_resource_constrained_(sched_state_, b))) {
       return {a, "kOriginalOrder"};
     }
     return {b, "kOriginalOrder"};
@@ -1138,6 +1149,7 @@ class ReadySetLt {
   const DefaultSchedulerCore::SchedulingState& sched_state_;
   DefaultSchedulerCore::TargetSchedulingRule target_scheduling_rule_;
   DefaultSchedulerCore::TargetSchedulingRule early_target_scheduling_rule_;
+  DefaultSchedulerCore::ResourceConstrainRule is_resource_constrained_;
 
   int ReadyIfScheduled(const HloGraphNode& gn) const {
     int ready_nodes_if_scheduled = 0;
@@ -1150,30 +1162,6 @@ class ReadySetLt {
   }
   static bool IsNop(const HloGraphNode& gn) {
     return IsNopInstruction(gn.GetInstr());
-  }
-  bool IsResourceConstrained(
-      DefaultSchedulerCore::ScheduleCandidate& cand) const {
-    if (cand.resource_constrained) {
-      return *cand.resource_constrained;
-    }
-    if (cand.node->GetResources().empty()) {
-      cand.resource_constrained = false;
-      return *(cand.resource_constrained);
-    }
-    cand.resource_constrained = false;
-    for (const auto& [resource_type, usage_type] : cand.node->GetResources()) {
-      auto max_it = sched_state_.max_concurrent_resource.find(resource_type);
-      auto res_it = sched_state_.resource_users_in_queue.find(resource_type);
-      cand.resource_constrained =
-          max_it != sched_state_.max_concurrent_resource.end() &&
-          max_it->second == 0 &&
-          res_it != sched_state_.resource_users_in_queue.end() &&
-          res_it->second > 0;
-      if (*cand.resource_constrained) {
-        return *cand.resource_constrained;
-      }
-    }
-    return *cand.resource_constrained;
   }
   bool ShouldScheduleAsyncDone(
       DefaultSchedulerCore::ScheduleCandidate& gn_cand) const {
@@ -1271,9 +1259,10 @@ class ReadySetLt {
             cand.node->GetResources());
     int64_t num_conflicting_resources = 0;
     for (int64_t resource : resources) {
-      if (!sched_state_.resources_in_flight.contains(resource)) continue;
+      if (!sched_state_.resource_occupiers_in_flight.contains(resource))
+        continue;
       num_conflicting_resources +=
-          sched_state_.resources_in_flight.at(resource);
+          sched_state_.resource_occupiers_in_flight.at(resource).size();
     }
     return num_conflicting_resources;
   }
@@ -1317,8 +1306,9 @@ DefaultSchedulerCore::FindAndExtractBestNodeAvailable(
         for (const auto& [resource, limit] :
              sched_state.max_concurrent_resource) {
           // No resources in flight of this kind. Continue.
-          auto it = sched_state.resources_in_flight.find(resource);
-          if (it == sched_state.resources_in_flight.end() || it->second == 0) {
+          auto it = sched_state.resource_occupiers_in_flight.find(resource);
+          if (it == sched_state.resource_occupiers_in_flight.end() ||
+              it->second.size() == 0) {
             continue;
           }
           // Number of instances of 'resource' needed if this instruction was to
@@ -1334,7 +1324,7 @@ DefaultSchedulerCore::FindAndExtractBestNodeAvailable(
       };
   VLOG(2) << "Current time: " << sched_state.current_time;
   ReadySetLt ready_lt{&sched_state, target_scheduling_rule_,
-                      early_target_scheduling_rule_};
+                      early_target_scheduling_rule_, is_resource_constrained_};
   // Construct a schedule candidate for caching.
   ScheduleCandidate ready_chosen;
   auto chosen_it = sched_state.ready_set.end();
@@ -1430,6 +1420,33 @@ DefaultSchedulerCore::FindAndExtractBestNodeAvailable(
 
 void DefaultSchedulerCore::LogInstruction(const HloInstruction* instr) const {
   VLOG(5) << instr->ToString();
+}
+
+bool DefaultSchedulerCore::DefaultIsResourceConstrained(
+    const DefaultSchedulerCore::SchedulingState& sched_state,
+    DefaultSchedulerCore::ScheduleCandidate& cand) {
+  if (cand.resource_constrained) {
+    return *cand.resource_constrained;
+  }
+  if (cand.node->GetResources().empty()) {
+    cand.resource_constrained = false;
+    return *(cand.resource_constrained);
+  }
+  cand.resource_constrained = false;
+  for (const auto& [resource_type, usage_type] : cand.node->GetResources()) {
+    auto max_it = sched_state.max_concurrent_resource.find(resource_type);
+    auto res_it = sched_state.resource_users_in_queue.find(resource_type);
+    cand.resource_constrained =
+        max_it != sched_state.max_concurrent_resource.end() &&
+        max_it->second == 0 &&
+        res_it != sched_state.resource_users_in_queue.end() &&
+        res_it->second > 0;
+
+    if (*cand.resource_constrained) {
+      return *cand.resource_constrained;
+    }
+  }
+  return *cand.resource_constrained;
 }
 
 void PrintOccupierList(
@@ -1902,9 +1919,9 @@ absl::StatusOr<HloGraphNode::TimeCost> DefaultSchedulerCore::ScheduleNode(
   ++sched_state->scheduled_count;
   for (auto& resource : n->GetResources()) {
     if (resource.second == ResourceUsageType::kResourceRelease) {
-      --sched_state->resources_in_flight[resource.first];
+      sched_state->resource_occupiers_in_flight[resource.first].erase(n);
     } else if (resource.second == ResourceUsageType::kResourceOccupy) {
-      ++sched_state->resources_in_flight[resource.first];
+      sched_state->resource_occupiers_in_flight[resource.first].insert(n);
     }
   }
   VLOG(10) << "Memory pressure before schedule: "

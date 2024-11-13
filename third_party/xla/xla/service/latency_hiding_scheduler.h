@@ -957,8 +957,9 @@ class DefaultSchedulerCore : public SchedulerCore {
     std::vector<HloInstruction*> new_sequence_reversed;
     // Units of time passed in the schedule. To keep track of latency hiding.
     HloGraphNode::TimeCost current_time = 0;
-    // Number of resources in flight.
-    ResourceMap resources_in_flight;
+    // Resources and corresponding occupiers in flight.
+    absl::flat_hash_map<int64_t, absl::flat_hash_set<HloGraphNode*>>
+        resource_occupiers_in_flight;
     // Number of instructions using the key resource type in the set waiting to
     // be scheduled.
     ResourceMap resource_users_in_queue;
@@ -1008,12 +1009,16 @@ class DefaultSchedulerCore : public SchedulerCore {
           config(config) {}
   };
 
+  using ResourceConstrainRule =
+      std::function<bool(const SchedulingState&, ScheduleCandidate&)>;
   using PostProcessingFn = std::function<void(SchedulingState&)>;
 
   DefaultSchedulerCore(
       HloCostAnalysis::ShapeSizeFunction shape_size_bytes,
       const AsyncTracker* async_tracker,
       const LatencyEstimator* latency_estimator, const SchedulerConfig& config,
+      ResourceConstrainRule is_resource_constrained =
+          DefaultIsResourceConstrained,
       TargetSchedulingRule target_scheduling_rule = nullptr,
       TargetSchedulingRule early_target_scheduling_rule = nullptr,
       PostProcessingFn post_processing_fn = nullptr)
@@ -1021,6 +1026,7 @@ class DefaultSchedulerCore : public SchedulerCore {
         async_tracker_(async_tracker),
         latency_estimator_(latency_estimator),
         config_(config),
+        is_resource_constrained_(is_resource_constrained),
         target_scheduling_rule_(target_scheduling_rule),
         early_target_scheduling_rule_(early_target_scheduling_rule),
         post_processing_fn_(post_processing_fn) {}
@@ -1066,6 +1072,8 @@ class DefaultSchedulerCore : public SchedulerCore {
       const HloComputation* computation, const HloScheduleGraph& schedule_graph,
       const std::vector<HloInstruction*>& instructions,
       int cycles_per_microsecond, const DebugOptions& debug_options);
+  static bool DefaultIsResourceConstrained(const SchedulingState& sched_state,
+                                           ScheduleCandidate& cand);
 
   HloCostAnalysis::ShapeSizeFunction shape_size_bytes_;
   std::unique_ptr<ModulePressureState> module_pressure_state_;
@@ -1075,6 +1083,7 @@ class DefaultSchedulerCore : public SchedulerCore {
   SchedulerConfig config_;
   TargetSchedulingRule target_scheduling_rule_ = nullptr;
   TargetSchedulingRule early_target_scheduling_rule_ = nullptr;
+  ResourceConstrainRule is_resource_constrained_ = nullptr;
   PostProcessingFn post_processing_fn_ = nullptr;
   std::unique_ptr<AnnotationTracker> annotation_tracker_;
 };
