@@ -1688,20 +1688,10 @@ std::optional<HloSharding> GatherOperandShardingFromOutputParallelDimensions(
     parallel_dims.indices_parallel_dims.assign(
         dnums.start_indices_batching_dims().begin(),
         dnums.start_indices_batching_dims().end());
-  }
-  if (std::optional<GatherScatterParallelDims> implicit_parallel_dims =
-          GetGatherParallelBatchDims(gather, call_graph)) {
-    parallel_dims.operand_parallel_dims.insert(
-        parallel_dims.operand_parallel_dims.end(),
-        implicit_parallel_dims->operand_parallel_dims.begin(),
-        implicit_parallel_dims->operand_parallel_dims.end());
-    parallel_dims.indices_parallel_dims.insert(
-        parallel_dims.indices_parallel_dims.end(),
-        implicit_parallel_dims->indices_parallel_dims.begin(),
-        implicit_parallel_dims->indices_parallel_dims.end());
-  }
-
-  if (parallel_dims.operand_parallel_dims.empty()) {
+  } else if (std::optional<GatherScatterParallelDims> implicit_parallel_dims =
+                 GetGatherParallelBatchDims(gather, call_graph)) {
+    parallel_dims = *implicit_parallel_dims;
+  } else {
     return std::nullopt;
   }
 
@@ -1870,20 +1860,10 @@ std::optional<HloSharding> ScatterUpdateShardingFromOutputParallelDimensions(
     parallel_dims.indices_parallel_dims.assign(
         dnums.scatter_indices_batching_dims().begin(),
         dnums.scatter_indices_batching_dims().end());
-  }
-  if (std::optional<GatherScatterParallelDims> implicit_parallel_dims =
-          GetScatterParallelBatchDims(scatter, call_graph)) {
-    parallel_dims.operand_parallel_dims.insert(
-        parallel_dims.operand_parallel_dims.end(),
-        implicit_parallel_dims->operand_parallel_dims.begin(),
-        implicit_parallel_dims->operand_parallel_dims.end());
-    parallel_dims.indices_parallel_dims.insert(
-        parallel_dims.indices_parallel_dims.end(),
-        implicit_parallel_dims->indices_parallel_dims.begin(),
-        implicit_parallel_dims->indices_parallel_dims.end());
-  }
-
-  if (parallel_dims.operand_parallel_dims.empty()) {
+  } else if (std::optional<GatherScatterParallelDims> implicit_parallel_dims =
+                 GetScatterParallelBatchDims(scatter, call_graph)) {
+    parallel_dims = *implicit_parallel_dims;
+  } else {
     return std::nullopt;
   }
 
